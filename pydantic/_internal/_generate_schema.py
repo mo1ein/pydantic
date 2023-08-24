@@ -41,7 +41,7 @@ from ..config import ConfigDict, JsonEncoder
 from ..errors import PydanticSchemaGenerationError, PydanticUndefinedAnnotation, PydanticUserError
 from ..fields import AliasChoices, AliasPath, FieldInfo
 from ..json_schema import JsonSchemaValue
-from ..version import VERSION
+from ..version import version_short
 from ..warnings import PydanticDeprecatedSince20
 from . import _decorators, _discriminated_union, _known_annotated_metadata, _typing_extra
 from ._annotated_handlers import GetCoreSchemaHandler, GetJsonSchemaHandler
@@ -219,7 +219,7 @@ def modify_model_json_schema(
         original_schema['title'] = cls.__name__
     docstring = cls.__doc__
     if docstring and 'description' not in original_schema:
-        original_schema['description'] = docstring
+        original_schema['description'] = inspect.cleandoc(docstring)
     return json_schema
 
 
@@ -249,7 +249,7 @@ def _add_custom_serialization_from_json_encoders(
             continue
 
         warnings.warn(
-            f'`json_encoders` is deprecated. See https://docs.pydantic.dev/{VERSION}/usage/serialization/#custom-serializers for alternatives',
+            f'`json_encoders` is deprecated. See https://docs.pydantic.dev/{version_short()}/usage/serialization/#custom-serializers for alternatives',
             PydanticDeprecatedSince20,
         )
 
@@ -587,16 +587,25 @@ class GenerateSchema:
         else:
             ref_mode = 'to-def'
 
+        schema: CoreSchema
         get_schema = getattr(obj, '__get_pydantic_core_schema__', None)
         if get_schema is None:
-            return None
-
-        schema: CoreSchema
-        if len(inspect.signature(get_schema).parameters) == 1:
-            # (source) -> CoreSchema
-            schema = get_schema(source)
+            validators = getattr(obj, '__get_validators__', None)
+            if validators is None:
+                return None
+            warn(
+                '`__get_validators__` is deprecated and will be removed, use `__get_pydantic_core_schema__` instead.',
+                PydanticDeprecatedSince20,
+            )
+            schema = core_schema.chain_schema([core_schema.general_plain_validator_function(v) for v in validators()])
         else:
-            schema = get_schema(source, CallbackGetCoreSchemaHandler(self._generate_schema, self, ref_mode=ref_mode))
+            if len(inspect.signature(get_schema).parameters) == 1:
+                # (source) -> CoreSchema
+                schema = get_schema(source)
+            else:
+                schema = get_schema(
+                    source, CallbackGetCoreSchemaHandler(self._generate_schema, self, ref_mode=ref_mode)
+                )
 
         schema = self._unpack_refs_defs(schema)
 
@@ -970,7 +979,7 @@ class GenerateSchema:
     def _union_schema(self, union_type: Any) -> core_schema.CoreSchema:
         """Generate schema for a Union."""
         args = self._get_args_resolving_forward_refs(union_type, required=True)
-        choices: list[core_schema.CoreSchema] = []
+        choices: list[CoreSchema | tuple[CoreSchema, str]] = []
         nullable = False
         for arg in args:
             if arg is None or arg is _typing_extra.NoneType:
@@ -979,7 +988,8 @@ class GenerateSchema:
                 choices.append(self.generate_schema(arg))
 
         if len(choices) == 1:
-            s = choices[0]
+            first_choice = choices[0]
+            s = first_choice[0] if isinstance(first_choice, tuple) else first_choice
         else:
             s = core_schema.union_schema(choices)
 
@@ -1130,7 +1140,9 @@ class GenerateSchema:
 
             arguments_schema = core_schema.arguments_schema(
                 [
-                    self._generate_parameter_schema(field_name, annotation)
+                    self._generate_parameter_schema(
+                        field_name, annotation, default=namedtuple_cls._field_defaults.get(field_name, Parameter.empty)
+                    )
                     for field_name, annotation in annotations.items()
                 ],
                 metadata=build_metadata_dict(js_prefer_positional_arguments=True),
@@ -1305,7 +1317,7 @@ class GenerateSchema:
 
                 self = self._current_generate_schema
 
-                from ._dataclasses import is_pydantic_dataclass
+                from ..dataclasses import is_pydantic_dataclass
 
                 if is_pydantic_dataclass(dataclass):
                     fields = dataclass.__pydantic_fields__
@@ -1436,6 +1448,7 @@ class GenerateSchema:
                 code='model-field-missing-annotation',
             )
 
+        return_type = replace_types(return_type, self._typevars_map)
         return_type_schema = self.generate_schema(return_type)
         # Apply serializers to computed field if there exist
         return_type_schema = self._apply_field_serializers(
@@ -1543,11 +1556,6 @@ class GenerateSchema:
         # expand annotations before we start processing them so that `__prepare_pydantic_annotations` can consume
         # individual items from GroupedMetadata
         annotations = list(_known_annotated_metadata.expand_grouped_metadata(annotations))
-        non_field_infos, field_infos = [a for a in annotations if not isinstance(a, FieldInfo)], [
-            a for a in annotations if isinstance(a, FieldInfo)
-        ]
-        if field_infos:
-            annotations = [*non_field_infos, FieldInfo.merge_field_infos(*field_infos)]
         idx = -1
         prepare = getattr(source_type, '__prepare_pydantic_annotations__', None)
         if prepare:

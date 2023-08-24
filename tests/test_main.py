@@ -28,6 +28,7 @@ from pydantic_core import CoreSchema, core_schema
 from typing_extensions import Annotated, Final, Literal
 
 from pydantic import (
+    AfterValidator,
     BaseModel,
     ConfigDict,
     Field,
@@ -38,12 +39,13 @@ from pydantic import (
     PydanticUndefinedAnnotation,
     PydanticUserError,
     SecretStr,
+    StringConstraints,
+    TypeAdapter,
     ValidationError,
     ValidationInfo,
     constr,
     field_validator,
 )
-from pydantic.type_adapter import TypeAdapter
 
 
 def test_success():
@@ -498,6 +500,19 @@ def test_frozen_model():
         m.a = 11
     assert exc_info.value.errors(include_url=False) == [
         {'type': 'frozen_instance', 'loc': ('a',), 'msg': 'Instance is frozen', 'input': 11}
+    ]
+
+
+def test_frozen_field():
+    class FrozenModel(BaseModel):
+        a: int = Field(10, frozen=True)
+
+    m = FrozenModel()
+
+    with pytest.raises(ValidationError) as exc_info:
+        m.a = 11
+    assert exc_info.value.errors(include_url=False) == [
+        {'type': 'frozen_field', 'loc': ('a',), 'msg': 'Field is frozen', 'input': 11}
     ]
 
 
@@ -1658,7 +1673,7 @@ def test_base_config_type_hinting():
     get_type_hints(type(M.model_config))
 
 
-def test_frozen_field():
+def test_frozen_field_with_validate_assignment():
     """assigning a frozen=True field should raise a TypeError"""
 
     class Entry(BaseModel):
@@ -2807,3 +2822,103 @@ def test_schema_generator_customize_type() -> None:
         model_config = ConfigDict(schema_generator=LaxStrGenerator)
 
     assert Model(x=1).x == '1'
+
+
+def test_schema_generator_customize_type_constraints() -> None:
+    class LaxStrGenerator(GenerateSchema):
+        def str_schema(self) -> CoreSchema:
+            return core_schema.no_info_plain_validator_function(str)
+
+    class Model(BaseModel):
+        x: Annotated[str, Field(pattern='^\\d+$')]
+        y: Annotated[float, Field(gt=0)]
+        z: Annotated[List[int], Field(min_length=1)]
+        model_config = ConfigDict(schema_generator=LaxStrGenerator)
+
+    # insert_assert(Model(x='123', y=1, z=[-1]).model_dump())
+    assert Model(x='123', y=1, z=[-1]).model_dump() == {'x': '123', 'y': 1.0, 'z': [-1]}
+
+    with pytest.raises(ValidationError) as exc_info:
+        Model(x='abc', y=-1, z=[])
+
+    # insert_assert(exc_info.value.errors(include_url=False))
+    assert exc_info.value.errors(include_url=False) == [
+        {
+            'type': 'string_pattern_mismatch',
+            'loc': ('x',),
+            'msg': "String should match pattern '^\\d+$'",
+            'input': 'abc',
+            'ctx': {'pattern': '^\\d+$'},
+        },
+        {
+            'type': 'greater_than',
+            'loc': ('y',),
+            'msg': 'Input should be greater than 0',
+            'input': -1,
+            'ctx': {'gt': 0.0},
+        },
+        {
+            'type': 'too_short',
+            'loc': ('z',),
+            'msg': 'List should have at least 1 item after validation, not 0',
+            'input': [],
+            'ctx': {'field_type': 'List', 'min_length': 1, 'actual_length': 0},
+        },
+    ]
+
+
+def test_schema_generator_customize_type_constraints_order() -> None:
+    class Model(BaseModel):
+        # whitespace will be stripped first, then max length will be checked, should pass on ' 1 '
+        x: Annotated[str, AfterValidator(lambda x: x.strip()), StringConstraints(max_length=1)]
+        # max length will be checked first, then whitespace will be stripped, should fail on ' 1 '
+        y: Annotated[str, StringConstraints(max_length=1), AfterValidator(lambda x: x.strip())]
+
+    with pytest.raises(ValidationError) as exc_info:
+        Model(x=' 1 ', y=' 1 ')
+
+    # insert_assert(exc_info.value.errors(include_url=False))
+    assert exc_info.value.errors(include_url=False) == [
+        {
+            'type': 'string_too_long',
+            'loc': ('y',),
+            'msg': 'String should have at most 1 characters',
+            'input': ' 1 ',
+            'ctx': {'max_length': 1},
+        }
+    ]
+
+
+def test_shadow_attribute() -> None:
+    """https://github.com/pydantic/pydantic/issues/7108"""
+
+    class Model(BaseModel):
+        foo: str
+
+        @classmethod
+        def __pydantic_init_subclass__(cls, **kwargs: Any):
+            super().__pydantic_init_subclass__(**kwargs)
+            for key in cls.model_fields.keys():
+                setattr(cls, key, getattr(cls, key, '') + ' edited!')
+
+    class One(Model):
+        foo: str = 'abc'
+
+    with pytest.warns(UserWarning, match=r'"foo" shadows an attribute in parent ".*One"'):
+
+        class Two(One):
+            foo: str
+
+    with pytest.warns(UserWarning, match=r'"foo" shadows an attribute in parent ".*One"'):
+
+        class Three(One):
+            foo: str = 'xyz'
+
+    # unlike dataclasses BaseModel does not preserve the value of defaults
+    # so when we access the attribute in `Model.__pydantic_init_subclass__` there is no default
+    # and hence we append `edited!` to an empty string
+    # we've talked about changing this but this is the current behavior as of this test
+    assert getattr(Model, 'foo', None) is None
+    assert getattr(One, 'foo', None) == ' edited!'
+    assert getattr(Two, 'foo', None) == ' edited! edited!'
+    assert getattr(Three, 'foo', None) == ' edited! edited!'
